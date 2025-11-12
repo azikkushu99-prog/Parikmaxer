@@ -1,9 +1,13 @@
 import logging
-from aiogram import Router, types, F
+from aiogram import Router, types, F, Bot
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import db
+from datetime import datetime, timedelta
+import asyncio
+import aiosqlite
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +33,7 @@ def get_admin_keyboard():
     builder.button(text="➕ Добавить слот", callback_data="add_slot")
     builder.button(text="❌ Удалить слот", callback_data="del_slot")
     builder.button(text="📋 Просмотр записей", callback_data="view_appointments")
+    builder.button(text="🔧 Исправить время", callback_data="fix_time_format")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -104,15 +109,33 @@ async def get_time(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS:
         return
 
+    # Нормализуем формат времени: заменяем точки на двоеточия
+    time_input = message.text.strip()
+    normalized_time = time_input.replace('.', ':')
+    
+    # Проверяем формат времени
+    try:
+        hours, minutes = normalized_time.split(':')
+        if len(hours) != 2 or len(minutes) != 2:
+            raise ValueError
+        int(hours), int(minutes)
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат времени!\n\n"
+            "⏰ Введите время в формате ЧЧ:ММ (например, 14:30):",
+            reply_markup=get_cancel_action_keyboard()
+        )
+        return
+
     data = await state.get_data()
-    success = await db.add_slot(data['new_date'], data['new_day'], message.text)
+    success = await db.add_slot(data['new_date'], data['new_day'], normalized_time)
 
     if success:
         await message.answer(
             f"✅ Слот успешно добавлен!\n\n"
             f"📅 Дата: {data['new_date']}\n"
             f"📆 День: {data['new_day']}\n"
-            f"⏰ Время: {message.text}",
+            f"⏰ Время: {normalized_time}",
             reply_markup=get_admin_keyboard()
         )
     else:
@@ -386,3 +409,109 @@ async def view_appointments_time(callback: types.CallbackQuery):
         text,
         reply_markup=builder.as_markup()
     )
+
+
+# Исправление формата времени
+@admin_router.callback_query(F.data == "fix_time_format")
+async def fix_time_format(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Доступ запрещен", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "🔧 Исправление формата времени в слотах...\n\n"
+        "⏳ Пожалуйста, подождите...",
+        reply_markup=get_back_to_admin_keyboard()
+    )
+
+    try:
+        # Получаем все слоты
+        slots = await db.get_available_slots()
+        fixed_count = 0
+        
+        for slot in slots:
+            old_time = slot['time']
+            # Заменяем точки на двоеточия
+            if '.' in old_time:
+                new_time = old_time.replace('.', ':')
+                # Обновляем слот в базе данных
+                async with aiosqlite.connect('bot.db') as db_conn:
+                    await db_conn.execute(
+                        "UPDATE slots SET time = ? WHERE id = ?",
+                        (new_time, slot['id'])
+                    )
+                    await db_conn.commit()
+                fixed_count += 1
+        
+        if fixed_count > 0:
+            await callback.message.edit_text(
+                f"✅ Формат времени исправлен!\n\n"
+                f"🔧 Обновлено слотов: {fixed_count}\n\n"
+                f"💡 Теперь время отображается в правильном формате ЧЧ:ММ",
+                reply_markup=get_admin_keyboard()
+            )
+        else:
+            await callback.message.edit_text(
+                "ℹ️ Все слоты уже имеют правильный формат времени.",
+                reply_markup=get_admin_keyboard()
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка при исправлении формата времени: {e}")
+        await callback.message.edit_text(
+            f"❌ Ошибка при исправлении формата времени: {e}",
+            reply_markup=get_admin_keyboard()
+        )
+
+
+# Команда для исправления времени через сообщение
+@admin_router.message(Command("fix_time"))
+async def cmd_fix_time(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+
+    await message.answer(
+        "🔧 Исправление формата времени в слотах...\n\n"
+        "⏳ Пожалуйста, подождите...",
+        reply_markup=get_back_to_admin_keyboard()
+    )
+
+    try:
+        # Получаем все слоты
+        slots = await db.get_available_slots()
+        fixed_count = 0
+        
+        for slot in slots:
+            old_time = slot['time']
+            # Заменяем точки на двоеточия
+            if '.' in old_time:
+                new_time = old_time.replace('.', ':')
+                # Обновляем слот в базе данных
+                async with aiosqlite.connect('bot.db') as db_conn:
+                    await db_conn.execute(
+                        "UPDATE slots SET time = ? WHERE id = ?",
+                        (new_time, slot['id'])
+                    )
+                    await db_conn.commit()
+                fixed_count += 1
+        
+        if fixed_count > 0:
+            await message.answer(
+                f"✅ Формат времени исправлен!\n\n"
+                f"🔧 Обновлено слотов: {fixed_count}\n\n"
+                f"💡 Теперь время отображается в правильном формате ЧЧ:ММ",
+                reply_markup=get_admin_keyboard()
+            )
+        else:
+            await message.answer(
+                "ℹ️ Все слоты уже имеют правильный формат времени.",
+                reply_markup=get_admin_keyboard()
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка при исправлении формата времени: {e}")
+        await message.answer(
+            f"❌ Ошибка при исправлении формата времени: {e}",
+            reply_markup=get_admin_keyboard()
+        )
