@@ -8,10 +8,12 @@ from aiogram.types import (
     ReplyKeyboardRemove
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramBadRequest
 import asyncio
 import db
 from admin import admin_router, get_admin_keyboard
+from datetime import datetime, timedelta
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -97,6 +99,117 @@ def get_cancel_name_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="❌ Отмена", callback_data="cancel_name_input")
     return builder.as_markup()
+
+
+# Сервис напоминаний
+async def check_reminders():
+    """Проверяет и отправляет напоминания о записях"""
+    while True:
+        try:
+            appointments = await db.get_appointments_for_reminders()
+            now = datetime.now()
+
+            for appointment in appointments:
+                try:
+                    # Парсим дату и время записи
+                    appointment_date = parse_appointment_date(appointment['date'], appointment['time'])
+                    if not appointment_date:
+                        continue
+
+                    time_diff = appointment_date - now
+                    hours_diff = time_diff.total_seconds() / 3600
+
+                    # Напоминание за 24 часа
+                    if 24 <= hours_diff <= 25 and not appointment['reminder_24h_sent']:
+                        await send_reminder_24h(appointment)
+                        await db.update_reminder_status(appointment['id'], '24h', True)
+                        logger.info(f"Отправлено напоминание за 24 часа для записи {appointment['id']}")
+
+                    # Напоминание за 1 час
+                    elif 1 <= hours_diff <= 2 and not appointment['reminder_1h_sent']:
+                        await send_reminder_1h(appointment)
+                        await db.update_reminder_status(appointment['id'], '1h', True)
+                        logger.info(f"Отправлено напоминание за 1 час для записи {appointment['id']}")
+
+                except Exception as e:
+                    logger.error(f"Ошибка при обработке напоминания для записи {appointment['id']}: {e}")
+
+            # Проверяем каждые 60 секунд
+            await asyncio.sleep(60)
+
+        except Exception as e:
+            logger.error(f"Ошибка в сервисе напоминаний: {e}")
+            await asyncio.sleep(60)
+
+
+def parse_appointment_date(date_str, time_str):
+    """Парсит дату и время из строк в объект datetime"""
+    try:
+        # Предполагаем формат DD.MM для даты и HH:MM для времени
+        day, month = map(int, date_str.split('.'))
+        hour, minute = map(int, time_str.split(':'))
+
+        current_year = datetime.now().year
+        appointment_date = datetime(current_year, month, day, hour, minute)
+
+        # Если дата уже прошла в этом году, предполагаем следующий год
+        if appointment_date < datetime.now():
+            appointment_date = datetime(current_year + 1, month, day, hour, minute)
+
+        return appointment_date
+    except Exception as e:
+        logger.error(f"Ошибка парсинга даты {date_str} {time_str}: {e}")
+        return None
+
+
+async def send_reminder_24h(appointment):
+    """Отправляет напоминание за 24 часа"""
+    try:
+        message_text = (
+            "👋 Привет! Напоминаем о вашей записи завтра!\n\n"
+            f"📅 Дата: {appointment['date']}\n"
+            f"⏰ Время: {appointment['time']}\n"
+            f"👤 Имя: {appointment['client_name']}\n\n"
+            "💈 Не забудьте прочитать правила посещения и прийти вовремя! 😊\n\n"
+            "✨ Ждем вас с нетерпением! ✨"
+        )
+
+        await bot.send_message(
+            appointment['user_id'],
+            message_text
+        )
+    except TelegramBadRequest as e:
+        if "chat not found" in str(e):
+            logger.warning(f"Пользователь {appointment['user_id']} заблокировал бота, невозможно отправить напоминание")
+        else:
+            logger.error(f"Не удалось отправить напоминание за 24 часа: {e}")
+    except Exception as e:
+        logger.error(f"Не удалось отправить напоминание за 24 часа: {e}")
+
+
+async def send_reminder_1h(appointment):
+    """Отправляет напоминание за 1 час"""
+    try:
+        message_text = (
+            "⏰ Скорее-скорее! Напоминаем о вашей записи через час!\n\n"
+            f"📅 Дата: {appointment['date']}\n"
+            f"⏰ Время: {appointment['time']}\n"
+            f"👤 Имя: {appointment['client_name']}\n\n"
+            "🚀 Успейте подготовиться и приходите вовремя! 💪\n\n"
+            "💖 Мы уже готовимся к вашему визиту! 💖"
+        )
+
+        await bot.send_message(
+            appointment['user_id'],
+            message_text
+        )
+    except TelegramBadRequest as e:
+        if "chat not found" in str(e):
+            logger.warning(f"Пользователь {appointment['user_id']} заблокировал бота, невозможно отправить напоминание")
+        else:
+            logger.error(f"Не удалось отправить напоминание за 1 час: {e}")
+    except Exception as e:
+        logger.error(f"Не удалось отправить напоминание за 1 час: {e}")
 
 
 # Обработчики
@@ -541,6 +654,9 @@ async def cancel_appointment(callback: types.CallbackQuery):
 
 async def main():
     await db.init_db()
+
+    # Запускаем сервис напоминаний в фоне
+    asyncio.create_task(check_reminders())
 
     # Настраиваем обработку ошибок при запуске
     try:
