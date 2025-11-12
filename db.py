@@ -45,6 +45,8 @@ async def init_db():
                 date TEXT,
                 time TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                reminder_24h_sent BOOLEAN DEFAULT 0,
+                reminder_1h_sent BOOLEAN DEFAULT 0,
                 FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
             )
         ''')
@@ -97,6 +99,15 @@ async def add_missing_columns():
         if 'time' not in column_names:
             await db.execute("ALTER TABLE appointments ADD COLUMN time TEXT")
             logger.info("Добавлена колонка time в таблицу appointments")
+
+        # Добавляем колонки для напоминаний
+        if 'reminder_24h_sent' not in column_names:
+            await db.execute("ALTER TABLE appointments ADD COLUMN reminder_24h_sent BOOLEAN DEFAULT 0")
+            logger.info("Добавлена колонка reminder_24h_sent в таблицу appointments")
+
+        if 'reminder_1h_sent' not in column_names:
+            await db.execute("ALTER TABLE appointments ADD COLUMN reminder_1h_sent BOOLEAN DEFAULT 0")
+            logger.info("Добавлена колонка reminder_1h_sent в таблицу appointments")
 
         await db.commit()
 
@@ -245,7 +256,7 @@ async def get_user_appointments(user_id):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute('''
-            SELECT a.id, a.date, a.time, a.client_name, a.slot_id
+            SELECT a.id, a.date, a.time, a.client_name, a.slot_id, a.reminder_24h_sent, a.reminder_1h_sent
             FROM appointments a
             WHERE a.user_id = ? AND a.date IS NOT NULL AND a.time IS NOT NULL
             ORDER BY a.date, a.time
@@ -321,6 +332,35 @@ async def get_appointments_by_date(date):
             ORDER BY a.time
         ''', (date,))
         return await cursor.fetchall()
+
+
+async def get_appointments_for_reminders():
+    """Получает записи, для которых нужно отправить напоминания"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute('''
+            SELECT a.*, u.user_id, u.username, u.phone
+            FROM appointments a
+            JOIN users u ON a.user_id = u.user_id
+            WHERE a.date IS NOT NULL AND a.time IS NOT NULL
+        ''')
+        return await cursor.fetchall()
+
+
+async def update_reminder_status(appointment_id, reminder_type, sent=True):
+    """Обновляет статус отправки напоминания"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if reminder_type == '24h':
+            await db.execute(
+                "UPDATE appointments SET reminder_24h_sent = ? WHERE id = ?",
+                (1 if sent else 0, appointment_id)
+            )
+        elif reminder_type == '1h':
+            await db.execute(
+                "UPDATE appointments SET reminder_1h_sent = ? WHERE id = ?",
+                (1 if sent else 0, appointment_id)
+            )
+        await db.commit()
 
 
 # Опросы
