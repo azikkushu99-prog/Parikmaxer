@@ -1,144 +1,290 @@
 import logging
-from aiogram import Router, types, F
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardRemove
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramBadRequest
+import asyncio
 import db
+from admin import admin_router, get_admin_keyboard
+from datetime import datetime, timedelta
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+TOKEN = "8128570631:AAFhVFcNneJJHYEdkFzTcJXWnl_9rixS5tM"
 ADMIN_IDS = [785219206, 5176507854]
 
-admin_router = Router()
+# Создаем бота с увеличенным таймаутом
+bot = Bot(token=TOKEN, timeout=60)
+dp = Dispatcher()
+
+# Включаем роутеры
+dp.include_router(admin_router)
 
 
-# Состояния FSM для админа
-class AdminStates(StatesGroup):
-    waiting_for_date = State()
-    waiting_for_day = State()
-    waiting_for_time = State()
-    waiting_for_del_date = State()
-    waiting_for_del_time = State()
-    waiting_for_notification = State()
+# Состояния FSM
+class UserStates(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_name = State()
 
 
-# Клавиатура админ панели
-def get_admin_keyboard():
+# Функция для повторных попыток при сетевых ошибках
+async def safe_edit_message(message: types.Message, text: str, reply_markup=None, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            await message.edit_text(text, reply_markup=reply_markup)
+            return True
+        except (TelegramNetworkError, TelegramRetryAfter) as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Экспоненциальная backoff
+                logger.warning(f"Сетевая ошибка, повтор через {wait_time} сек: {e}")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Не удалось отредактировать сообщение после {max_retries} попыток: {e}")
+                return False
+        except Exception as e:
+            logger.error(f"Ошибка при редактировании сообщения: {e}")
+            return False
+    return False
+
+
+# Клавиатуры
+def get_phone_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Поделиться номером", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+
+# Инлайн-клавиатура главного меню
+def get_main_inline_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Добавить слот", callback_data="add_slot")
-    builder.button(text="❌ Удалить слот", callback_data="del_slot")
-    builder.button(text="📋 Просмотр записей", callback_data="view_appointments")
+    builder.button(text="✂️ Записаться на стрижку", callback_data="book_haircut")
+    builder.button(text="📋 Мои записи", callback_data="my_appointments")
     builder.adjust(1)
     return builder.as_markup()
 
 
-# Клавиатура с кнопкой Назад в админ-меню
-def get_back_to_admin_keyboard():
+# Клавиатура с кнопкой Назад в главное меню
+def get_back_to_main_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 Назад в админ-панель", callback_data="back_to_admin")
+    builder.button(text="🔙 Назад в меню", callback_data="back_to_main")
     return builder.as_markup()
 
 
-# Клавиатура для отмены действий
-def get_cancel_action_keyboard():
+# Клавиатура с кнопкой Назад к выбору даты
+def get_back_to_dates_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.button(text="❌ Отменить", callback_data="back_to_admin")
+    builder.button(text="🔙 Назад к датам", callback_data="back_to_dates")
     return builder.as_markup()
 
 
-# Навигация в админ-панели
-@admin_router.callback_query(F.data == "back_to_admin")
-async def back_to_admin(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text(
-        "👨‍💼 Панель администратора:\n\n"
-        "ℹ️ Выберите действие:",
-        reply_markup=get_admin_keyboard()
-    )
+# Клавиатура с кнопкой Назад к записям
+def get_back_to_appointments_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад к записям", callback_data="back_to_appointments")
+    return builder.as_markup()
 
 
-# Добавление слота
-@admin_router.callback_query(F.data == "add_slot")
-async def add_slot_start(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("❌ Доступ запрещен", show_alert=True)
-        return
-
-    await callback.message.edit_text(
-        "➕ Добавление нового слота:\n\n"
-        "📅 Введите дату в формате ДД.ММ (например, 25.12):",
-        reply_markup=get_cancel_action_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_for_date)
+# Клавиатура для отмены ввода имени
+def get_cancel_name_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="cancel_name_input")
+    return builder.as_markup()
 
 
-@admin_router.message(AdminStates.waiting_for_date)
-async def get_date(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
+# Сервис напоминаний
+async def check_reminders():
+    """Проверяет и отправляет напоминания о записях"""
+    while True:
+        try:
+            appointments = await db.get_appointments_for_reminders()
+            now = datetime.now()
 
-    await state.update_data(new_date=message.text)
-    await message.answer(
-        "📅 Введите день недели (пн, вт, ср, чт, пт, сб, вс):",
-        reply_markup=get_cancel_action_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_for_day)
+            for appointment in appointments:
+                try:
+                    # Парсим дату и время записи
+                    appointment_date = parse_appointment_date(appointment['date'], appointment['time'])
+                    if not appointment_date:
+                        continue
+
+                    time_diff = appointment_date - now
+                    hours_diff = time_diff.total_seconds() / 3600
+
+                    # Напоминание за 24 часа
+                    if 24 <= hours_diff <= 25 and not appointment['reminder_24h_sent']:
+                        await send_reminder_24h(appointment)
+                        await db.update_reminder_status(appointment['id'], '24h', True)
+                        logger.info(f"Отправлено напоминание за 24 часа для записи {appointment['id']}")
+
+                    # Напоминание за 1 час
+                    elif 1 <= hours_diff <= 2 and not appointment['reminder_1h_sent']:
+                        await send_reminder_1h(appointment)
+                        await db.update_reminder_status(appointment['id'], '1h', True)
+                        logger.info(f"Отправлено напоминание за 1 час для записи {appointment['id']}")
+
+                except Exception as e:
+                    logger.error(f"Ошибка при обработке напоминания для записи {appointment['id']}: {e}")
+
+            # Проверяем каждые 60 секунд
+            await asyncio.sleep(60)
+
+        except Exception as e:
+            logger.error(f"Ошибка в сервисе напоминаний: {e}")
+            await asyncio.sleep(60)
 
 
-@admin_router.message(AdminStates.waiting_for_day)
-async def get_day(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
+def parse_appointment_date(date_str, time_str):
+    """Парсит дату и время из строк в объект datetime"""
+    try:
+        # Предполагаем формат DD.MM для даты и HH:MM для времени
+        day, month = map(int, date_str.split('.'))
+        hour, minute = map(int, time_str.split(':'))
 
-    await state.update_data(new_day=message.text)
-    await message.answer(
-        "⏰ Введите время в формате ЧЧ:ММ (например, 14:30):",
-        reply_markup=get_cancel_action_keyboard()
-    )
-    await state.set_state(AdminStates.waiting_for_time)
+        current_year = datetime.now().year
+        appointment_date = datetime(current_year, month, day, hour, minute)
+
+        # Если дата уже прошла в этом году, предполагаем следующий год
+        if appointment_date < datetime.now():
+            appointment_date = datetime(current_year + 1, month, day, hour, minute)
+
+        return appointment_date
+    except Exception as e:
+        logger.error(f"Ошибка парсинга даты {date_str} {time_str}: {e}")
+        return None
 
 
-@admin_router.message(AdminStates.waiting_for_time)
-async def get_time(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
-    data = await state.get_data()
-    success = await db.add_slot(data['new_date'], data['new_day'], message.text)
-
-    if success:
-        await message.answer(
-            f"✅ Слот успешно добавлен!\n\n"
-            f"📅 Дата: {data['new_date']}\n"
-            f"📆 День: {data['new_day']}\n"
-            f"⏰ Время: {message.text}",
-            reply_markup=get_admin_keyboard()
+async def send_reminder_24h(appointment):
+    """Отправляет напоминание за 24 часа"""
+    try:
+        message_text = (
+            "👋 Привет! Напоминаем о вашей записи завтра!\n\n"
+            f"📅 Дата: {appointment['date']}\n"
+            f"⏰ Время: {appointment['time']}\n"
+            f"👤 Имя: {appointment['client_name']}\n\n"
+            "💈 Не забудьте прочитать правила посещения и прийти вовремя! 😊\n\n"
+            "✨ Ждем вас с нетерпением! ✨"
         )
+
+        await bot.send_message(
+            appointment['user_id'],
+            message_text
+        )
+    except TelegramBadRequest as e:
+        if "chat not found" in str(e):
+            logger.warning(f"Пользователь {appointment['user_id']} заблокировал бота, невозможно отправить напоминание")
+        else:
+            logger.error(f"Не удалось отправить напоминание за 24 часа: {e}")
+    except Exception as e:
+        logger.error(f"Не удалось отправить напоминание за 24 часа: {e}")
+
+
+async def send_reminder_1h(appointment):
+    """Отправляет напоминание за 1 час"""
+    try:
+        message_text = (
+            "⏰ Скорее-скорее! Напоминаем о вашей записи через час!\n\n"
+            f"📅 Дата: {appointment['date']}\n"
+            f"⏰ Время: {appointment['time']}\n"
+            f"👤 Имя: {appointment['client_name']}\n\n"
+            "🚀 Успейте подготовиться и приходите вовремя! 💪\n\n"
+            "💖 Мы уже готовимся к вашему визиту! 💖"
+        )
+
+        await bot.send_message(
+            appointment['user_id'],
+            message_text
+        )
+    except TelegramBadRequest as e:
+        if "chat not found" in str(e):
+            logger.warning(f"Пользователь {appointment['user_id']} заблокировал бота, невозможно отправить напоминание")
+        else:
+            logger.error(f"Не удалось отправить напоминание за 1 час: {e}")
+    except Exception as e:
+        logger.error(f"Не удалось отправить напоминание за 1 час: {e}")
+
+
+# Обработчики
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    user = message.from_user
+    user_data = await db.get_user(user.id)
+
+    if user_data:
+        await message.answer(
+            "👋 Добро пожаловать в главное меню! Выберите действие:",
+            reply_markup=get_main_inline_keyboard()
+        )
+        await state.clear()
     else:
         await message.answer(
-            "❌ Ошибка: слот с такой датой и временем уже существует.\n\n"
-            "⚠️ Пожалуйста, введите другие данные.",
-            reply_markup=get_admin_keyboard()
+            "👋 Добро пожаловать! Для использования бота необходимо поделиться номером телефона.\n\n"
+            "📞 Нажмите кнопку ниже, чтобы поделиться номером:",
+            reply_markup=get_phone_keyboard()
         )
+        await state.set_state(UserStates.waiting_for_phone)
 
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+
+    await message.answer("👨‍💼 Панель администратора:", reply_markup=get_admin_keyboard())
+
+
+@dp.message(F.contact, UserStates.waiting_for_phone)
+async def get_phone(message: types.Message, state: FSMContext):
+    contact = message.contact
+    user = message.from_user
+
+    await db.add_user(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        phone=contact.phone_number
+    )
+
+    await message.answer(
+        "✅ Номер успешно сохранен!",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await message.answer(
+        "👋 Добро пожаловать в главное меню! Выберите действие:",
+        reply_markup=get_main_inline_keyboard()
+    )
     await state.clear()
 
 
-# Удаление слота
-@admin_router.callback_query(F.data == "del_slot")
-async def del_slot_start(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("❌ Доступ запрещен", show_alert=True)
-        return
+# Обработчики навигации
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit_message(
+        callback.message,
+        "👋 Добро пожаловать в главное меню! Выберите действие:",
+        get_main_inline_keyboard()
+    )
 
-    # Получаем все даты со слотами
-    dates = await db.get_all_dates_with_slots()
+
+@dp.callback_query(F.data == "back_to_dates")
+async def back_to_dates(callback: types.CallbackQuery):
+    dates = await db.get_all_dates()
 
     if not dates:
-        await callback.message.edit_text(
-            "❌ Нет доступных слотов для удаления.",
-            reply_markup=get_back_to_admin_keyboard()
+        await safe_edit_message(
+            callback.message,
+            "❌ На данный момент нет доступных дат для записи.",
+            get_back_to_main_keyboard()
         )
         return
 
@@ -146,243 +292,383 @@ async def del_slot_start(callback: types.CallbackQuery, state: FSMContext):
     for date in dates:
         builder.button(
             text=f"📅 {date['date']} ({date['day']})",
-            callback_data=f"deldate_{date['date']}"
+            callback_data=f"date_{date['date']}"
         )
     builder.adjust(1)
-    builder.row(types.InlineKeyboardButton(text="🔙 Назад в админ-панель", callback_data="back_to_admin"))
+    builder.row(types.InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main"))
 
-    await callback.message.edit_text(
-        "🗑️ Удаление слота:\n\n"
-        "📅 Выберите дату:",
-        reply_markup=builder.as_markup()
-    )
-    await state.set_state(AdminStates.waiting_for_del_date)
-
-
-@admin_router.callback_query(AdminStates.waiting_for_del_date, F.data.startswith("deldate_"))
-async def del_date(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
-        return
-
-    date = callback.data.split("_")[1]
-    await state.update_data(del_date=date)
-
-    # Получаем все слоты на эту дату (и занятые и свободные)
-    slots = await db.get_all_slots_by_date(date)
-
-    if not slots:
-        await callback.message.edit_text(
-            f"❌ На дату {date} нет слотов.",
-            reply_markup=get_back_to_admin_keyboard()
-        )
-        await state.clear()
-        return
-
-    builder = InlineKeyboardBuilder()
-    for slot in slots:
-        # Проверяем, есть ли запись на этот слот
-        appointment = await db.get_appointment_by_slot_id(slot['id'])
-        status = "🔴 Занят" if appointment else "🟢 Свободен"
-        builder.button(
-            text=f"⏰ {slot['time']} ({status})",
-            callback_data=f"deltime_{slot['id']}"
-        )
-    builder.adjust(1)
-    builder.row(types.InlineKeyboardButton(text="🔙 Назад к датам", callback_data="del_slot"))
-
-    await callback.message.edit_text(
-        f"🗑️ Удаление слота:\n\n"
-        f"📅 Выбрана дата: {date}\n\n"
-        f"⏰ Выберите время для удаления:\n"
-        f"🟢 Свободен - можно удалить без оповещения\n"
-        f"🔴 Занят - будет запрошено сообщение для пользователя",
-        reply_markup=builder.as_markup()
-    )
-    await state.set_state(AdminStates.waiting_for_del_time)
-
-
-@admin_router.callback_query(AdminStates.waiting_for_del_time, F.data.startswith("deltime_"))
-async def del_time(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
-        return
-
-    slot_id = int(callback.data.split("_")[1])
-    slot = await db.get_slot(slot_id)
-
-    if not slot:
-        await callback.message.edit_text(
-            "❌ Слот не найден.",
-            reply_markup=get_back_to_admin_keyboard()
-        )
-        await state.clear()
-        return
-
-    # Проверяем, есть ли запись на этот слот
-    appointment = await db.get_appointment_by_slot_id(slot_id)
-
-    if appointment:
-        # Если есть запись, просим админа написать сообщение для пользователя
-        await state.update_data(
-            del_slot_id=slot_id,
-            appointment_id=appointment['id'],
-            appointment_user_id=appointment['user_id'],
-            appointment_date=appointment['date'],
-            appointment_time=appointment['time'],
-            client_name=appointment['client_name']
-        )
-
-        await callback.message.edit_text(
-            f"⚠️ На этот слот есть активная запись!\n\n"
-            f"👤 Клиент: {appointment['client_name']}\n"
-            f"📅 Дата: {appointment['date']}\n"
-            f"⏰ Время: {appointment['time']}\n\n"
-            f"💬 Пожалуйста, напишите сообщение для пользователя, которое будет отправлено при отмене записи:",
-            reply_markup=get_cancel_action_keyboard()
-        )
-        await state.set_state(AdminStates.waiting_for_notification)
-    else:
-        # Если записи нет, просто удаляем слот
-        await db.delete_slot(slot_id)
-        await callback.message.edit_text(
-            "✅ Слот удален (без активных записей).",
-            reply_markup=get_admin_keyboard()
-        )
-        await state.clear()
-
-
-@admin_router.message(AdminStates.waiting_for_notification)
-async def send_notification_and_delete(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
-    data = await state.get_data()
-    slot_id = data['del_slot_id']
-    appointment_id = data['appointment_id']
-    user_id = data['appointment_user_id']
-    notification_text = message.text
-
-    try:
-        # Отправляем сообщение пользователю
-        await message.bot.send_message(
-            user_id,
-            f"❌ Ваша запись отменена администратором.\n\n"
-            f"📅 Дата: {data['appointment_date']}\n"
-            f"⏰ Время: {data['appointment_time']}\n"
-            f"👤 Имя: {data['client_name']}\n\n"
-            f"💬 Сообщение от администратора: {notification_text}\n\n"
-            f"⚠️ Пожалуйста, запишитесь на другое время."
-        )
-
-        # Удаляем запись и слот
-        await db.delete_appointment(appointment_id)
-        await db.delete_slot(slot_id)
-
-        await message.answer(
-            "✅ Слот удален с оповещением пользователя.",
-            reply_markup=get_admin_keyboard()
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при отправке уведомления: {e}")
-        # Если не удалось отправить сообщение, все равно удаляем
-        await db.delete_appointment(appointment_id)
-        await db.delete_slot(slot_id)
-        await message.answer(
-            f"✅ Слот удален, но не удалось отправить уведомление пользователю: {e}",
-            reply_markup=get_admin_keyboard()
-        )
-
-    await state.clear()
-
-
-# Просмотр записей
-@admin_router.callback_query(F.data == "view_appointments")
-async def view_appointments_start(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("❌ Доступ запрещен", show_alert=True)
-        return
-
-    dates = await db.get_dates_with_appointments()
-
-    if not dates:
-        await callback.message.edit_text(
-            "📭 Нет активных записей.",
-            reply_markup=get_back_to_admin_keyboard()
-        )
-        return
-
-    builder = InlineKeyboardBuilder()
-    for date in dates:
-        builder.button(
-            text=f"📅 {date['date']}",
-            callback_data=f"viewdate_{date['date']}"
-        )
-    builder.adjust(1)
-    builder.row(types.InlineKeyboardButton(text="🔙 Назад в админ-панель", callback_data="back_to_admin"))
-
-    await callback.message.edit_text(
-        "📋 Просмотр записей:\n\n"
-        "📅 Выберите дату:",
-        reply_markup=builder.as_markup()
+    await safe_edit_message(
+        callback.message,
+        "📅 Выберите удобную дату для записи:",
+        builder.as_markup()
     )
 
 
-@admin_router.callback_query(F.data.startswith("viewdate_"))
-async def view_appointments_date(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        return
-
-    date = callback.data.split("_")[1]
-    appointments = await db.get_appointments_by_date(date)
+@dp.callback_query(F.data == "back_to_appointments")
+async def back_to_appointments(callback: types.CallbackQuery):
+    appointments = await db.get_user_appointments(callback.from_user.id)
 
     if not appointments:
-        await callback.message.edit_text(
-            f"📭 На дату {date} нет записей.",
-            reply_markup=get_back_to_admin_keyboard()
+        await safe_edit_message(
+            callback.message,
+            "📭 У вас пока нет активных записей.",
+            get_back_to_main_keyboard()
         )
         return
 
     builder = InlineKeyboardBuilder()
     for app in appointments:
         builder.button(
-            text=f"⏰ {app['time']} - {app['client_name']}",
-            callback_data=f"viewapp_{app['id']}"
+            text=f"📅 {app['date']} ⏰ {app['time']}",
+            callback_data=f"app_{app['id']}"
         )
     builder.adjust(1)
-    builder.row(types.InlineKeyboardButton(text="🔙 Назад к датам", callback_data="view_appointments"))
+    builder.row(types.InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main"))
 
-    await callback.message.edit_text(
-        f"📋 Записи на {date}:\n\n"
-        "ℹ️ Выберите запись для просмотра деталей:",
-        reply_markup=builder.as_markup()
+    await safe_edit_message(
+        callback.message,
+        "📋 Ваши активные записи:\n\n"
+        "ℹ️ Нажмите на запись для просмотра деталей или отмены:",
+        builder.as_markup()
     )
 
 
-@admin_router.callback_query(F.data.startswith("viewapp_"))
-async def view_appointments_time(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
+@dp.callback_query(F.data == "cancel_name_input")
+async def cancel_name_input(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit_message(
+        callback.message,
+        "❌ Ввод имени отменен.",
+        get_main_inline_keyboard()
+    )
+
+
+# Обработчики инлайн-кнопок главного меню
+@dp.callback_query(F.data == "book_haircut")
+async def show_dates(callback: types.CallbackQuery):
+    dates = await db.get_all_dates()
+
+    if not dates:
+        await safe_edit_message(
+            callback.message,
+            "❌ На данный момент нет доступных дат для записи.\n\n"
+            "⚠️ Пожалуйста, попробуйте позже или свяжитесь с администратором.",
+            get_back_to_main_keyboard()
+        )
         return
 
+    builder = InlineKeyboardBuilder()
+    for date in dates:
+        builder.button(
+            text=f"📅 {date['date']} ({date['day']})",
+            callback_data=f"date_{date['date']}"
+        )
+    builder.adjust(1)
+    builder.row(types.InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main"))
+
+    await safe_edit_message(
+        callback.message,
+        "📅 Выберите удобную дату для записи:",
+        builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "my_appointments")
+async def show_my_appointments(callback: types.CallbackQuery):
+    appointments = await db.get_user_appointments(callback.from_user.id)
+
+    if not appointments:
+        await safe_edit_message(
+            callback.message,
+            "📭 У вас пока нет активных записей.\n\n"
+            "💡 Вы можете записаться на стрижку, нажав соответствующую кнопку в меню.",
+            get_back_to_main_keyboard()
+        )
+        return
+
+    builder = InlineKeyboardBuilder()
+    for app in appointments:
+        builder.button(
+            text=f"📅 {app['date']} ⏰ {app['time']}",
+            callback_data=f"app_{app['id']}"
+        )
+    builder.adjust(1)
+    builder.row(types.InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main"))
+
+    await safe_edit_message(
+        callback.message,
+        "📋 Ваши активные записи:\n\n"
+        "ℹ️ Нажмите на запись для просмотра деталей или отмены:",
+        builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("date_"))
+async def show_times(callback: types.CallbackQuery, state: FSMContext):
+    date = callback.data.split("_")[1]
+    slots = await db.get_slots_by_date(date)
+
+    builder = InlineKeyboardBuilder()
+    available_slots = [slot for slot in slots if slot['available']]
+
+    if not available_slots:
+        await safe_edit_message(
+            callback.message,
+            f"❌ На дату {date} нет доступных времен для записи.",
+            get_back_to_dates_keyboard()
+        )
+        return
+
+    for slot in available_slots:
+        builder.button(
+            text=f"⏰ {slot['time']}",
+            callback_data=f"time_{slot['id']}"
+        )
+
+    builder.adjust(2)
+    builder.row(types.InlineKeyboardButton(text="🔙 Назад к датам", callback_data="back_to_dates"))
+
+    await safe_edit_message(
+        callback.message,
+        f"📅 Выбрана дата: {date}\n\n"
+        "⏰ Выберите удобное время:",
+        builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("time_"))
+async def get_name_for_booking(callback: types.CallbackQuery, state: FSMContext):
+    slot_id = int(callback.data.split("_")[1])
+
+    # Получаем информацию о слоте до записи
+    slot = await db.get_slot(slot_id)
+    if not slot:
+        await safe_edit_message(
+            callback.message,
+            "❌ Извините, это время уже занято.\n\n"
+            "⚠️ Пожалуйста, выберите другое время.",
+            get_back_to_dates_keyboard()
+        )
+        return
+
+    await state.update_data(selected_slot=slot_id, slot_date=slot['date'], slot_time=slot['time'])
+
+    await safe_edit_message(
+        callback.message,
+        "✍️ Введите ваше имя для записи:\n\n"
+        "ℹ️ Это имя будет использоваться для вашей записи.",
+        get_cancel_name_keyboard()
+    )
+    await state.set_state(UserStates.waiting_for_name)
+
+
+@dp.message(UserStates.waiting_for_name)
+async def confirm_booking(message: types.Message, state: FSMContext):
+    name = message.text.strip()
+
+    if not name or len(name) < 2:
+        await message.answer(
+            "❌ Имя должно содержать хотя бы 2 символа.\n\n"
+            "✍️ Пожалуйста, введите ваше имя еще раз:",
+            reply_markup=get_cancel_name_keyboard()
+        )
+        return
+
+    user_data = await state.get_data()
+    slot_id = user_data['selected_slot']
+    slot_date = user_data['slot_date']
+    slot_time = user_data['slot_time']
+
+    success = await db.add_appointment(message.from_user.id, slot_id, name, slot_date, slot_time)
+
+    if not success:
+        await message.answer(
+            "❌ Извините, это время уже занято.\n\n"
+            "⚠️ Пожалуйста, выберите другое время.",
+            reply_markup=get_main_inline_keyboard()
+        )
+        await state.clear()
+        return
+
+    user = await db.get_user(message.from_user.id)
+
+    # Отправляем подтверждение пользователю
+    await message.answer(
+        f"✅ Вы успешно записаны!\n\n"
+        f"📅 Дата: {slot_date}\n"
+        f"⏰ Время: {slot_time}\n"
+        f"👤 Имя: {name}\n\n"
+        f"💡 Вы можете просмотреть или отменить запись в разделе \"Мои записи\".",
+        reply_markup=get_main_inline_keyboard()
+    )
+
+    # Уведомление админам с обработкой ошибок
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🔔 Новая запись!\n\n"
+                f"📅 Дата: {slot_date}\n"
+                f"⏰ Время: {slot_time}\n"
+                f"👤 Клиент: {name}\n"
+                f"👤 Username: @{message.from_user.username}\n"
+                f"📞 Телефон: {user['phone']}"
+            )
+        except (TelegramNetworkError, TelegramRetryAfter) as e:
+            logger.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("app_"))
+async def show_appointment_details(callback: types.CallbackQuery):
     app_id = int(callback.data.split("_")[1])
     appointment = await db.get_appointment(app_id)
 
-    if appointment:
-        text = (
-            f"📋 Детали записи:\n\n"
-            f"📅 Дата: {appointment['date']}\n"
-            f"⏰ Время: {appointment['time']}\n"
-            f"👤 Username: @{appointment['username']}\n"
-            f"👨‍💼 Имя: {appointment['first_name']}\n"
-            f"📞 Телефон: {appointment['phone']}\n"
-            f"✂️ Имя для записи: {appointment['client_name']}"
+    if not appointment:
+        await safe_edit_message(
+            callback.message,
+            "❌ Запись не найдена.",
+            get_back_to_appointments_keyboard()
         )
-    else:
-        text = "❌ Запись не найдена."
+        return
+
+    # Проверяем, принадлежит ли запись пользователю
+    if appointment['user_id'] != callback.from_user.id:
+        await safe_edit_message(
+            callback.message,
+            "❌ У вас нет доступа к этой записи.",
+            get_back_to_appointments_keyboard()
+        )
+        return
 
     builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 Назад к записям", callback_data=f"viewdate_{appointment['date']}")
-    builder.button(text="🏠 В админ-панель", callback_data="back_to_admin")
+    builder.button(text="❌ Отменить запись", callback_data=f"confirm_cancel_{app_id}")
+    builder.button(text="🔙 Назад к записям", callback_data="back_to_appointments")
+    builder.adjust(1)
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=builder.as_markup()
+    await safe_edit_message(
+        callback.message,
+        f"📋 Детали записи:\n\n"
+        f"📅 Дата: {appointment['date']}\n"
+        f"⏰ Время: {appointment['time']}\n"
+        f"👤 Имя: {appointment['client_name']}\n"
+        f"📞 Телефон: {appointment['phone']}\n\n"
+        f"ℹ️ Вы можете отменить запись, нажав кнопку ниже:",
+        builder.as_markup()
     )
+
+
+@dp.callback_query(F.data.startswith("confirm_cancel_"))
+async def show_cancel_confirmation(callback: types.CallbackQuery):
+    app_id = int(callback.data.split("_")[2])
+    appointment = await db.get_appointment(app_id)
+
+    if not appointment:
+        await safe_edit_message(
+            callback.message,
+            "❌ Запись не найдена.",
+            get_back_to_appointments_keyboard()
+        )
+        return
+
+    # Проверяем, принадлежит ли запись пользователю
+    if appointment['user_id'] != callback.from_user.id:
+        await safe_edit_message(
+            callback.message,
+            "❌ У вас нет доступа к этой записи.",
+            get_back_to_appointments_keyboard()
+        )
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Да, отменить", callback_data=f"do_cancel_{app_id}")
+    builder.button(text="❌ Нет, вернуться", callback_data=f"app_{app_id}")
+    builder.adjust(2)
+
+    await safe_edit_message(
+        callback.message,
+        f"⚠️ Вы уверены, что хотите отменить запись?\n\n"
+        f"📅 Дата: {appointment['date']}\n"
+        f"⏰ Время: {appointment['time']}\n"
+        f"👤 Имя: {appointment['client_name']}\n\n"
+        f"❌ Это действие нельзя отменить!",
+        builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("do_cancel_"))
+async def cancel_appointment(callback: types.CallbackQuery):
+    app_id = int(callback.data.split("_")[2])
+    appointment = await db.get_appointment(app_id)
+
+    if not appointment:
+        await safe_edit_message(
+            callback.message,
+            "❌ Запись не найдена.",
+            get_back_to_appointments_keyboard()
+        )
+        return
+
+    # Проверяем, принадлежит ли запись пользователю
+    if appointment['user_id'] != callback.from_user.id:
+        await safe_edit_message(
+            callback.message,
+            "❌ У вас нет доступа к этой записи.",
+            get_back_to_appointments_keyboard()
+        )
+        return
+
+    success = await db.delete_appointment(app_id, callback.from_user.id)
+
+    if success:
+        await safe_edit_message(
+            callback.message,
+            f"✅ Запись успешно отменена!\n\n"
+            f"📅 Дата: {appointment['date']}\n"
+            f"⏰ Время: {appointment['time']}\n\n"
+            f"💡 Вы можете записаться на другое время.",
+            get_main_inline_keyboard()
+        )
+
+        # Уведомление админам с обработкой ошибок
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"❌ Запись отменена!\n\n"
+                    f"📅 Дата: {appointment['date']}\n"
+                    f"⏰ Время: {appointment['time']}\n"
+                    f"👤 Пользователь: @{callback.from_user.username}"
+                )
+            except (TelegramNetworkError, TelegramRetryAfter) as e:
+                logger.warning(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+    else:
+        await safe_edit_message(
+            callback.message,
+            "❌ Произошла ошибка при отмене записи.\n\n"
+            "⚠️ Пожалуйста, попробуйте позже.",
+            get_back_to_appointments_keyboard()
+        )
+
+
+async def main():
+    await db.init_db()
+
+    # Запускаем сервис напоминаний в фоне
+    asyncio.create_task(check_reminders())
+
+    # Настраиваем обработку ошибок при запуске
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Ошибка при запуске бота: {e}")
+        # Перезапуск через 10 секунд
+        await asyncio.sleep(10)
+        await main()
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    asyncio.run(main())
