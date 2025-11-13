@@ -343,6 +343,7 @@ async def get_appointments_for_reminders():
             FROM appointments a
             JOIN users u ON a.user_id = u.user_id
             WHERE a.date IS NOT NULL AND a.time IS NOT NULL
+            AND (a.reminder_24h_sent = 0 OR a.reminder_1h_sent = 0)
         ''')
         return await cursor.fetchall()
 
