@@ -112,21 +112,27 @@ async def check_reminders():
             for appointment in appointments:
                 try:
                     # Парсим дату и время записи
-                    appointment_date = parse_appointment_date(appointment['date'], appointment['time'])
-                    if not appointment_date:
+                    appointment_datetime = parse_appointment_datetime(appointment['date'], appointment['time'])
+                    if not appointment_datetime:
                         continue
 
-                    time_diff = appointment_date - now
-                    hours_diff = time_diff.total_seconds() / 3600
+                    # Вычисляем точное время для напоминаний
+                    reminder_24h_time = appointment_datetime - timedelta(hours=24)
+                    reminder_1h_time = appointment_datetime - timedelta(hours=1)
 
-                    # Напоминание за 24 часа
-                    if 24 <= hours_diff <= 25 and not appointment['reminder_24h_sent']:
+                    # Текущее время с точностью до минуты (игнорируем секунды)
+                    current_time = now.replace(second=0, microsecond=0)
+                    reminder_24h_time = reminder_24h_time.replace(second=0, microsecond=0)
+                    reminder_1h_time = reminder_1h_time.replace(second=0, microsecond=0)
+
+                    # Напоминание за 24 часа (ровно за 24 часа)
+                    if current_time == reminder_24h_time and not appointment['reminder_24h_sent']:
                         await send_reminder_24h(appointment)
                         await db.update_reminder_status(appointment['id'], '24h', True)
                         logger.info(f"Отправлено напоминание за 24 часа для записи {appointment['id']}")
 
-                    # Напоминание за 1 час
-                    elif 1 <= hours_diff <= 2 and not appointment['reminder_1h_sent']:
+                    # Напоминание за 1 час (ровно за 1 час)
+                    elif current_time == reminder_1h_time and not appointment['reminder_1h_sent']:
                         await send_reminder_1h(appointment)
                         await db.update_reminder_status(appointment['id'], '1h', True)
                         logger.info(f"Отправлено напоминание за 1 час для записи {appointment['id']}")
@@ -134,15 +140,16 @@ async def check_reminders():
                 except Exception as e:
                     logger.error(f"Ошибка при обработке напоминания для записи {appointment['id']}: {e}")
 
-            # Проверяем каждые 60 секунд
+            # Проверяем каждую минуту (60 секунд) - оптимально для слабого сервера
             await asyncio.sleep(60)
 
         except Exception as e:
             logger.error(f"Ошибка в сервисе напоминаний: {e}")
-            await asyncio.sleep(60)
+            # При ошибке ждем 2 минуты перед повторной попыткой
+            await asyncio.sleep(120)
 
 
-def parse_appointment_date(date_str, time_str):
+def parse_appointment_datetime(date_str, time_str):
     """Парсит дату и время из строк в объект datetime"""
     try:
         # Предполагаем формат DD.MM для даты и HH:MM для времени
@@ -150,13 +157,14 @@ def parse_appointment_date(date_str, time_str):
         hour, minute = map(int, time_str.split(':'))
 
         current_year = datetime.now().year
-        appointment_date = datetime(current_year, month, day, hour, minute)
+        # Создаем datetime объект (предполагаем, что время указано для Новосибирска UTC+7)
+        appointment_datetime = datetime(current_year, month, day, hour, minute)
 
         # Если дата уже прошла в этом году, предполагаем следующий год
-        if appointment_date < datetime.now():
-            appointment_date = datetime(current_year + 1, month, day, hour, minute)
+        if appointment_datetime < datetime.now():
+            appointment_datetime = datetime(current_year + 1, month, day, hour, minute)
 
-        return appointment_date
+        return appointment_datetime
     except Exception as e:
         logger.error(f"Ошибка парсинга даты {date_str} {time_str}: {e}")
         return None
@@ -663,8 +671,8 @@ async def main():
         await dp.start_polling(bot)
     except Exception as e:
         logger.error(f"Ошибка при запуске бота: {e}")
-        # Перезапуск через 10 секунд
-        await asyncio.sleep(10)
+        # Перезапуск через 30 секунд
+        await asyncio.sleep(30)
         await main()
 
 
