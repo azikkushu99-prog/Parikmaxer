@@ -112,7 +112,7 @@ async def get_time(message: types.Message, state: FSMContext):
     # Нормализуем формат времени: заменяем точки на двоеточия
     time_input = message.text.strip()
     normalized_time = time_input.replace('.', ':')
-    
+
     # Проверяем формат времени
     try:
         hours, minutes = normalized_time.split(':')
@@ -428,7 +428,7 @@ async def fix_time_format(callback: types.CallbackQuery):
         # Получаем все слоты
         slots = await db.get_available_slots()
         fixed_count = 0
-        
+
         for slot in slots:
             old_time = slot['time']
             # Заменяем точки на двоеточия
@@ -442,7 +442,7 @@ async def fix_time_format(callback: types.CallbackQuery):
                     )
                     await db_conn.commit()
                 fixed_count += 1
-        
+
         if fixed_count > 0:
             await callback.message.edit_text(
                 f"✅ Формат времени исправлен!\n\n"
@@ -455,7 +455,7 @@ async def fix_time_format(callback: types.CallbackQuery):
                 "ℹ️ Все слоты уже имеют правильный формат времени.",
                 reply_markup=get_admin_keyboard()
             )
-            
+
     except Exception as e:
         logger.error(f"Ошибка при исправлении формата времени: {e}")
         await callback.message.edit_text(
@@ -481,7 +481,7 @@ async def cmd_fix_time(message: types.Message):
         # Получаем все слоты
         slots = await db.get_available_slots()
         fixed_count = 0
-        
+
         for slot in slots:
             old_time = slot['time']
             # Заменяем точки на двоеточия
@@ -495,7 +495,7 @@ async def cmd_fix_time(message: types.Message):
                     )
                     await db_conn.commit()
                 fixed_count += 1
-        
+
         if fixed_count > 0:
             await message.answer(
                 f"✅ Формат времени исправлен!\n\n"
@@ -508,7 +508,7 @@ async def cmd_fix_time(message: types.Message):
                 "ℹ️ Все слоты уже имеют правильный формат времени.",
                 reply_markup=get_admin_keyboard()
             )
-            
+
     except Exception as e:
         logger.error(f"Ошибка при исправлении формата времени: {e}")
         await message.answer(
